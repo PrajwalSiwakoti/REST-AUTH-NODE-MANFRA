@@ -4,6 +4,8 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { authenticator } = require('otplib');
 const QRCode = require('qrcode');
+const crypto = require('crypto');
+const NodeCache = require('node-cache');
 
 const config = require('./config.js');
 
@@ -11,6 +13,8 @@ const app = express();
 
 //configure body parser
 app.use(express.json());
+
+const cache = new NodeCache({ stdTTL: 100, checkperiod: 120 });
 
 //simulating a database with nedb
 //nedb is a lightweight database for Node.js, it stores data in JSON format and is easy to use
@@ -81,6 +85,25 @@ app.post('/api/auth/login', async (req, res) => {
             return res.status(401).json({ message: 'Invalid credentials' });
         }
 
+        // Check if 2FA is enabled
+        if(user['2faEnabled']) {
+            // If 2FA is enabled, we need to generate token
+            const tempToken = crypto.randomUUID();
+           
+            cache.set(config.cacheTemporaryTokenPrefx + tempToken, user._id, config.cacheTemporaryTokenExpiration);
+
+            return res.status(200).json({
+                message: '2FA is enabled, please verify your OTP',
+                tempToken,
+                expirationTimeInSeconds: config.cacheTemporaryTokenExpiration,
+                user: {
+                    id: user._id,
+                    name: user.name,
+                    email: user.email
+                }
+            });
+        }
+
         const accessToken = jwt.sign({ id: user._id, email: user.email }, config.accessTokenSecret, { subject: 'accessApi', expiresIn: config.accessTokenExpiration });
         const refreshToken = jwt.sign({ id: user._id, email: user.email }, config.refreshTokenSecret, { subject: 'refreshToken', expiresIn: config.refreshTokenExpiration });
 
@@ -136,6 +159,53 @@ app.post('/api/auth/refresh-token', authenticateToken, async (req, res) => {
         });
     }
     catch(err) {
+        return res.status(500).json({ message: err.message });
+    }
+});
+
+app.post('/api/auth/login/2fa/verify-temp-token', async (req, res) => {
+    try {
+        const { tempToken, totp } = req.body;
+
+        if(!tempToken || !totp) {
+            return res.status(422).json({ message: 'Please provide the temp token and OTP' });
+        }
+
+        const userId = cache.get(config.cacheTemporaryTokenPrefx + tempToken);
+        if(!userId) {
+            return res.status(403).json({ message: 'Invalid temp token' });
+        }
+
+        const user = await users.findOne({ _id: userId });
+        if(!user) {
+            return res.status(401).json({ message: 'Unauthorized' });
+        }
+
+        const isValid = authenticator.check(totp, user['2faSecret']);
+        if(!isValid) {
+            return res.status(401).json({ message: 'Invalid OTP' });
+        }
+
+        cache.del(config.cacheTemporaryTokenPrefx + tempToken);
+
+        const accessToken = jwt.sign({ id: user._id, email: user.email }, config.accessTokenSecret, { subject: 'accessApi', expiresIn: config.accessTokenExpiration });
+        const refreshToken = jwt.sign({ id: user._id, email: user.email }, config.refreshTokenSecret, { subject: 'refreshToken', expiresIn: config.refreshTokenExpiration });
+
+        // Store the refresh token in the database
+        await userRefreshTokens.insert({ token: refreshToken, userId: user._id });
+        userRefreshTokens.compactDatafile();
+
+        return res.status(200).json({ 
+            message: 'User logged in successfully', 
+            user: {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                accessToken,
+                refreshToken
+            } 
+        });
+    }catch(err) {
         return res.status(500).json({ message: err.message });
     }
 });
